@@ -71,6 +71,40 @@ const Comment = mongoose.model("Comment", CommentSchema);
 const Review = mongoose.model("Review", ReviewSchema);
 const Project = mongoose.model("Project", ProjectSchema);
 
+// ========== ЧАТЫ ==========
+const ChatSchema = new mongoose.Schema({
+  users: { type: [String], required: true },
+  createdAt: { type: Date, default: Date.now },
+  lastMessage: { type: Date, default: Date.now }
+});
+
+const MessageSchema = new mongoose.Schema({
+  chatId: { type: String, required: true },
+  from: { type: String, required: true },
+  type: { type: String, default: "text" },
+  text: { type: String, default: "" },
+  image: { type: String, default: null },
+  emoji: { type: String, default: null },
+  amount: { type: Number, default: 0 },
+  commission: { type: Number, default: 0 },
+  date: { type: Date, default: Date.now }
+});
+
+const EmojiSchema = new mongoose.Schema({
+  author: { type: String, required: true },
+  name: { type: String, required: true },
+  image: { type: String, required: true },
+  price: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Chat = mongoose.model("Chat", ChatSchema);
+const Message = mongoose.model("Message", MessageSchema);
+const Emoji = mongoose.model("Emoji", EmojiSchema);
+
+// ===== КОМИССИЯ ЗА ПЕРЕВОДЫ =====
+const TRANSFER_COMMISSION = 0.05; // 5% — идёт админу
+
 // ========== MIDDLEWARE ==========
 function auth(req, res, next) {
   const header = req.headers.authorization;
@@ -235,27 +269,32 @@ app.get("/api/posts", async (req, res) => {
 });
 
 app.post("/api/posts", auth, adminOnly, async (req, res) => {
-  const { text, tags } = req.body;
+  const { text, tags, date } = req.body;
   if (!text || text.length < 5) return res.status(400).json({ error: "Текст минимум 5 символов" });
+
+  const postDate = date ? new Date(date) : new Date();
+
   const post = await Post.create({
     author: req.user.login,
     text,
-    tags: tags || []
+    tags: tags || [],
+    date: postDate
   });
   res.json(post);
 });
-
 app.put("/api/posts/:id", auth, adminOnly, async (req, res) => {
-  const { text, tags } = req.body;
+  const { text, tags, date } = req.body;
+  const update = { text, tags: tags || [] };
+  if (date) update.date = new Date(date);
+
   const post = await Post.findByIdAndUpdate(
     req.params.id,
-    { text, tags: tags || [] },
+    update,
     { new: true }
   );
   if (!post) return res.status(404).json({ error: "Не найден" });
   res.json(post);
 });
-
 app.delete("/api/posts/:id", auth, adminOnly, async (req, res) => {
   await Post.findByIdAndDelete(req.params.id);
   await Comment.deleteMany({ postId: req.params.id });
@@ -342,6 +381,139 @@ app.put("/api/projects/:id", auth, adminOnly, async (req, res) => {
 app.delete("/api/projects/:id", auth, adminOnly, async (req, res) => {
   await Project.findByIdAndDelete(req.params.id);
   res.json({ ok: true });
+});
+
+// ========== ЧАТЫ API ==========
+
+// Создать или найти чат
+app.post("/api/chats", auth, async (req, res) => {
+  const { withUser } = req.body;
+  if (!withUser) return res.status(400).json({ error: "Нужен withUser" });
+  if (withUser === req.user.login) return res.status(400).json({ error: "Сам с собой нельзя" });
+
+  const target = await User.findOne({ login: withUser });
+  if (!target) return res.status(404).json({ error: "Юзер не найден" });
+
+  const users = [req.user.login, withUser].sort();
+  let chat = await Chat.findOne({ users: { $all: users, $size: 2 } });
+  if (!chat) chat = await Chat.create({ users });
+  res.json(chat);
+});
+
+// Мои чаты
+app.get("/api/chats", auth, async (req, res) => {
+  const chats = await Chat.find({ users: req.user.login }).sort({ lastMessage: -1 });
+  res.json(chats);
+});
+
+// Сообщения чата
+app.get("/api/chats/:id/messages", auth, async (req, res) => {
+  const chat = await Chat.findById(req.params.id);
+  if (!chat || !chat.users.includes(req.user.login)) {
+    return res.status(403).json({ error: "Нет доступа" });
+  }
+  const messages = await Message.find({ chatId: req.params.id }).sort({ date: 1 }).limit(200);
+  res.json(messages);
+});
+
+// Отправить сообщение
+app.post("/api/chats/:id/messages", auth, async (req, res) => {
+  const chat = await Chat.findById(req.params.id);
+  if (!chat || !chat.users.includes(req.user.login)) {
+    return res.status(403).json({ error: "Нет доступа" });
+  }
+
+  const { type, text, image, emoji } = req.body;
+
+  if (type === "image" && !image) return res.status(400).json({ error: "Нет картинки" });
+  if (type === "emoji" && !emoji) return res.status(400).json({ error: "Нет эмодзи" });
+  if ((!type || type === "text") && (!text || !text.trim())) {
+    return res.status(400).json({ error: "Пусто" });
+  }
+
+  const msg = await Message.create({
+    chatId: req.params.id,
+    from: req.user.login,
+    type: type || "text",
+    text: text || "",
+    image: image || null,
+    emoji: emoji || null
+  });
+
+  chat.lastMessage = new Date();
+  await chat.save();
+
+  res.json(msg);
+});
+
+// Перевод очков
+app.post("/api/chats/:id/transfer", auth, async (req, res) => {
+  const chat = await Chat.findById(req.params.id);
+  if (!chat || !chat.users.includes(req.user.login)) {
+    return res.status(403).json({ error: "Нет доступа" });
+  }
+
+  const toUser = chat.users.find(u => u !== req.user.login);
+  const amt = Number(req.body.amount);
+
+  if (!amt || amt < 1) return res.status(400).json({ error: "Минимум 1 очко" });
+
+  const from = await User.findOne({ login: req.user.login });
+  if (from.points < amt) return res.status(400).json({ error: "Мало очков" });
+
+  const commission = Math.floor(amt * TRANSFER_COMMISSION);
+  const toReceive = amt - commission;
+
+  from.points -= amt;
+  await from.save();
+
+  const to = await User.findOne({ login: toUser });
+  to.points += toReceive;
+  await to.save();
+
+  // Комиссия админу
+  const admin = await User.findOne({ login: process.env.ADMIN_LOGIN });
+  if (admin) {
+    admin.points += commission;
+    await admin.save();
+  }
+
+  const msg = await Message.create({
+    chatId: req.params.id,
+    from: req.user.login,
+    type: "transfer",
+    text: `Перевёл ${amt} очков. Комиссия: ${commission}`,
+    amount: amt,
+    commission
+  });
+
+  chat.lastMessage = new Date();
+  await chat.save();
+
+  res.json({ ok: true, message: msg, commission, toReceive });
+});
+
+// ===== КАСТОМНЫЕ ЭМОДЗИ =====
+app.get("/api/emojis", async (req, res) => {
+  const emojis = await Emoji.find().sort({ createdAt: -1 }).limit(100);
+  res.json(emojis);
+});
+
+app.post("/api/emojis", auth, async (req, res) => {
+  const { name, image, price } = req.body;
+  if (!name || name.length < 1 || name.length > 20) return res.status(400).json({ error: "Имя 1-20 символов" });
+  if (!image) return res.status(400).json({ error: "Нет картинки" });
+
+  const count = await Emoji.countDocuments({ author: req.user.login });
+  if (count >= 10) return res.status(400).json({ error: "Максимум 10 эмодзи" });
+
+  const emoji = await Emoji.create({
+    author: req.user.login,
+    name,
+    image,
+    price: Number(price) || 0
+  });
+  res.json(emoji);
 });
 
 // ========== МАГАЗИН ==========
