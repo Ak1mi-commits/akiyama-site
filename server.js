@@ -269,8 +269,20 @@ app.get("/api/posts", async (req, res) => {
 });
 
 app.post("/api/posts", auth, adminOnly, async (req, res) => {
-  const { text, tags, date } = req.body;
+  const { text, tags, date, image } = req.body;
   if (!text || text.length < 5) return res.status(400).json({ error: "Текст минимум 5 символов" });
+
+  const postDate = date ? new Date(date) : new Date();
+
+  const post = await Post.create({
+    author: req.user.login,
+    text,
+    tags: tags || [],
+    image: image || null,
+    date: postDate
+  });
+  res.json(post);
+});
 
   const postDate = date ? new Date(date) : new Date();
 
@@ -283,10 +295,19 @@ app.post("/api/posts", auth, adminOnly, async (req, res) => {
   res.json(post);
 });
 app.put("/api/posts/:id", auth, adminOnly, async (req, res) => {
-  const { text, tags, date } = req.body;
+  const { text, tags, date, image } = req.body;
   const update = { text, tags: tags || [] };
   if (date) update.date = new Date(date);
+  if (image !== undefined) update.image = image;
 
+  const post = await Post.findByIdAndUpdate(
+    req.params.id,
+    update,
+    { new: true }
+  );
+  if (!post) return res.status(404).json({ error: "Не найден" });
+  res.json(post);
+});
   const post = await Post.findByIdAndUpdate(
     req.params.id,
     update,
